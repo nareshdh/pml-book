@@ -20,97 +20,128 @@ See [this link](https://probml.github.io/pml-book/book2.html)
 
 
 
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/bash
+set -eu
 
-TARGET_REPOS=("repoa" "repob" "repoc" "repod")
-
-normalize() {
-  echo "$1" | tr '[:upper:]' '[:lower:]'
-}
-
-is_target_repo() {
-  local repo
-  repo="$(normalize "$1")"
-
-  for target in "${TARGET_REPOS[@]}"; do
-    if [[ "$repo" == "$target" ]]; then
-      return 0
-    fi
-  done
-
-  return 1
-}
+echo "Detecting triggering repo and branch..."
 
 TRIGGERED_REPO=""
 TRIGGERED_BRANCH=""
 TRIGGERED_REVISION=""
 TRIGGER_SOURCE=""
 
-echo "Detecting triggering repo and branch..."
+TARGET_REPOS="repoa repob repoc repod"
 
-# 1. Manual override via Bamboo plan variables
-if [[ -n "${bamboo_trigger_branch:-}" ]]; then
-  TRIGGERED_BRANCH="${bamboo_trigger_branch}"
-  TRIGGERED_REPO="${bamboo_trigger_repo:-repod}"
-  TRIGGERED_REVISION=""
-  TRIGGER_SOURCE="manual-plan-variable"
+lower() {
+  echo "$1" | tr '[:upper:]' '[:lower:]'
+}
 
-  echo "Using manual Bamboo variables:"
-  echo "  trigger_repo   = $TRIGGERED_REPO"
-  echo "  trigger_branch = $TRIGGERED_BRANCH"
+is_target_repo() {
+  repo="$(lower "$1")"
+  for target in $TARGET_REPOS; do
+    [ "$repo" = "$target" ] && return 0
+  done
+  return 1
+}
+
+get_git_branch() {
+  git rev-parse --abbrev-ref HEAD 2>/dev/null || true
+}
+
+get_git_revision() {
+  git rev-parse HEAD 2>/dev/null || true
+}
+
+BUILD_REASON="${bamboo_buildReason:-}"
+BUILD_REASON_LC="$(lower "$BUILD_REASON")"
+
+echo "Build reason: ${BUILD_REASON:-N/A}"
+
+# ------------------------------------------------------------
+# 1. Manual build: assume repoD and read branch from checked-out Git repo
+# ------------------------------------------------------------
+
+if echo "$BUILD_REASON_LC" | grep -q "manual"; then
+  echo "Manual build detected. Reading repoD branch from Git workspace."
+
+  TRIGGERED_REPO="repod"
+  TRIGGERED_BRANCH="$(get_git_branch)"
+  TRIGGERED_REVISION="$(get_git_revision)"
+  TRIGGER_SOURCE="manual-repod-git-branch"
 fi
 
-# 2. Repo-triggered build variables
-if [[ -z "$TRIGGERED_BRANCH" && -n "${bamboo_repository_branch_name:-}" ]]; then
-  TRIGGERED_REPO="${bamboo_repository_name:-unknown}"
-  TRIGGERED_BRANCH="${bamboo_repository_branch_name}"
-  TRIGGERED_REVISION="${bamboo_repository_revision_number:-}"
-  TRIGGER_SOURCE="bamboo-repository-trigger"
+# ------------------------------------------------------------
+# 2. Repository-triggered build variables
+# ------------------------------------------------------------
 
-  echo "Using Bamboo repository trigger variables."
+if [ -z "$TRIGGERED_BRANCH" ]; then
+  if [ -n "${bamboo_repository_name:-}" ] && [ -n "${bamboo_repository_branch_name:-}" ]; then
+    repo_lc="$(lower "$bamboo_repository_name")"
+
+    if is_target_repo "$repo_lc"; then
+      TRIGGERED_REPO="$repo_lc"
+      TRIGGERED_BRANCH="$bamboo_repository_branch_name"
+      TRIGGERED_REVISION="${bamboo_repository_revision_number:-}"
+      TRIGGER_SOURCE="bamboo-repository-trigger"
+    fi
+  fi
 fi
 
-# 3. Fallback: scan plan repositories
-if [[ -z "$TRIGGERED_BRANCH" ]]; then
+# ------------------------------------------------------------
+# 3. Automatic build fallback: scan changed plan repositories
+# ------------------------------------------------------------
+
+if [ -z "$TRIGGERED_BRANCH" ]; then
   echo "Scanning bamboo_planRepository variables..."
 
-  while IFS='=' read -r var repo_name; do
+  env | grep -E '^bamboo_planRepository_[0-9]+_name=' | sort -V | while IFS='=' read -r var repo_name
+  do
     repo_index="$(echo "$var" | sed -E 's/^bamboo_planRepository_([0-9]+)_name$/\1/')"
 
     branch_var="bamboo_planRepository_${repo_index}_branchName"
     revision_var="bamboo_planRepository_${repo_index}_revision"
     changed_var="bamboo_planRepository_${repo_index}_changed"
 
-    branch="${!branch_var:-}"
-    revision="${!revision_var:-}"
-    changed="${!changed_var:-}"
+    branch="$(eval echo "\${$branch_var:-}")"
+    revision="$(eval echo "\${$revision_var:-}")"
+    changed="$(eval echo "\${$changed_var:-}")"
+    changed_lc="$(lower "$changed")"
+    repo_lc="$(lower "$repo_name")"
 
     echo "Repo #$repo_index: $repo_name | branch=${branch:-N/A} | changed=${changed:-N/A}"
 
-    if is_target_repo "$repo_name" && [[ "${changed,,}" == "true" ]]; then
-      TRIGGERED_REPO="$repo_name"
-      TRIGGERED_BRANCH="$branch"
-      TRIGGERED_REVISION="$revision"
-      TRIGGER_SOURCE="planRepository-changed"
+    if is_target_repo "$repo_lc" && [ "$changed_lc" = "true" ]; then
+      {
+        echo "TRIGGERED_REPO=$repo_lc"
+        echo "TRIGGERED_BRANCH=$branch"
+        echo "TRIGGERED_REVISION=$revision"
+        echo "TRIGGER_SOURCE=planRepository-changed"
+      } > trigger-info.env.tmp
       break
     fi
-  done < <(env | grep -E '^bamboo_planRepository_[0-9]+_name=' | sort -V)
+  done
+
+  if [ -f trigger-info.env.tmp ]; then
+    . ./trigger-info.env.tmp
+    rm -f trigger-info.env.tmp
+  fi
 fi
 
-# 4. Final fallback for manual repoD build
-if [[ -z "$TRIGGERED_BRANCH" ]]; then
-  TRIGGERED_REPO="${bamboo_trigger_repo:-repod}"
-  TRIGGERED_BRANCH="${bamboo_planRepository_branchName:-${bamboo_repository_branch_name:-main}}"
-  TRIGGERED_REVISION=""
-  TRIGGER_SOURCE="default-manual-fallback"
+# ------------------------------------------------------------
+# 4. Final repoD fallback: read Git branch from repoD workspace
+# ------------------------------------------------------------
 
-  echo "No trigger repo found. Assuming manual repoD build."
+if [ -z "$TRIGGERED_BRANCH" ]; then
+  echo "No triggering repo detected. Assuming repoD/default repository."
+  TRIGGERED_REPO="repod"
+  TRIGGERED_BRANCH="$(get_git_branch)"
+  TRIGGERED_REVISION="$(get_git_revision)"
+  TRIGGER_SOURCE="repod-git-fallback"
 fi
 
-if [[ -z "$TRIGGERED_BRANCH" ]]; then
-  echo "ERROR: Could not determine branch."
-  env | sort | grep -Ei 'bamboo_(repository|planRepository|branch|trigger|buildReason|revision)' || true
+if [ -z "$TRIGGERED_BRANCH" ] || [ "$TRIGGERED_BRANCH" = "HEAD" ]; then
+  echo "ERROR: Could not determine repoD branch from Git."
+  echo "Make sure repoD checkout happens before this script task."
   exit 1
 fi
 
@@ -129,5 +160,3 @@ TRIGGERED_BRANCH=$TRIGGERED_BRANCH
 TRIGGERED_REVISION=$TRIGGERED_REVISION
 TRIGGER_SOURCE=$TRIGGER_SOURCE
 EOF
-
-cat trigger-info.env
